@@ -18,9 +18,23 @@ const difficulties = {
   hard:   { rows: 10, cols: 10, mines: 20 }
 };
 
-// Объекты для хранения текущих игр и настроек по chat_id
+// Объекты для хранения игр, настроек и состояний для кастомного ввода по chat_id
 const games = {};
 const chatSettings = {};
+const customRequests = {}; // true, если бот ждёт ввод параметров
+const gameMessages = {};   // id сообщения с игровым полем для каждого чата
+
+// ===== Функция для удаления предыдущего игрового сообщения =====
+async function deletePreviousGameMessage(chatId, ctx) {
+  if (gameMessages[chatId]) {
+    try {
+      await ctx.telegram.deleteMessage(chatId, gameMessages[chatId]);
+      gameMessages[chatId] = null;
+    } catch (error) {
+      console.error('Ошибка при удалении сообщения:', error);
+    }
+  }
+}
 
 // ===== Функции создания и обработки игры =====
 
@@ -92,7 +106,7 @@ function revealCell(game, r, c) {
   }
 }
 
-// Проверка на победу: если открыты все клетки, где нет мин
+// Проверка на победу: если открыты все безопасные клетки
 function isWin(game) {
   for (let r = 0; r < game.rows; r++) {
     for (let c = 0; c < game.cols; c++) {
@@ -143,6 +157,7 @@ function renderSettingsMenu() {
     [Markup.button.callback('Легко', 'set_easy')],
     [Markup.button.callback('Нормально', 'set_medium')],
     [Markup.button.callback('Сложно', 'set_hard')],
+    [Markup.button.callback('Кастом', 'set_custom')],
     [Markup.button.callback('Назад', 'menu_back')]
   ]);
 }
@@ -160,12 +175,14 @@ bot.command('menu', ctx => {
 });
 
 // Команда /new — начать новую игру с текущими настройками
-bot.command('new', ctx => {
+bot.command('new', async ctx => {
   const chatId = ctx.chat.id;
+  await deletePreviousGameMessage(chatId, ctx);
   const settings = chatSettings[chatId] || defaultSettings;
   const game = createGame(settings.rows, settings.cols, settings.mines);
   games[chatId] = game;
-  ctx.reply('Новая игра. Выберите клетку:', renderBoard(game));
+  const sentMsg = await ctx.reply('Новая игра. Выберите клетку:', renderBoard(game));
+  gameMessages[chatId] = sentMsg.message_id;
 });
 
 // Команда /settings — открыть меню настроек
@@ -182,9 +199,11 @@ bot.on('callback_query', async ctx => {
   if (data.startsWith('menu_')) {
     if (data === 'menu_new_game') {
       const settings = chatSettings[chatId] || defaultSettings;
+      await deletePreviousGameMessage(chatId, ctx);
       const game = createGame(settings.rows, settings.cols, settings.mines);
       games[chatId] = game;
-      await ctx.editMessageText('Новая игра. Выберите клетку:', renderBoard(game));
+      const sentMsg = await ctx.reply('Новая игра. Выберите клетку:', renderBoard(game));
+      gameMessages[chatId] = sentMsg.message_id;
       return ctx.answerCbQuery();
     } else if (data === 'menu_settings') {
       await ctx.editMessageText('Выберите сложность:', renderSettingsMenu());
@@ -193,7 +212,7 @@ bot.on('callback_query', async ctx => {
       await ctx.editMessageText(
         'Правила игры Сапёр:\n' +
         '1. Открывайте клетки, стараясь не попасть на мину.\n' +
-        '2. Если открыта клетка с числом — оно показывает, сколько мин находится в соседних клетках.\n' +
+        '2. Если открыта клетка с числом – оно показывает, сколько мин находится в соседних клетках.\n' +
         '3. Игра выигрывается, если открыть все безопасные клетки.\n\n' +
         'Нажмите "Новая игра", чтобы начать игру.',
         renderMainMenu()
@@ -205,7 +224,7 @@ bot.on('callback_query', async ctx => {
     }
   }
 
-  // Обработка выбора настроек
+  // Обработка выбора настроек (предустановленные и кастом)
   if (data.startsWith('set_')) {
     if (data === 'set_easy') {
       chatSettings[chatId] = difficulties.easy;
@@ -222,6 +241,12 @@ bot.on('callback_query', async ctx => {
       await ctx.answerCbQuery('Настройки установлены: Сложно');
       await ctx.editMessageText('Настройки сохранены: Сложно', renderMainMenu());
       return;
+    } else if (data === 'set_custom') {
+      // Устанавливаем флаг ожидания ввода параметров
+      customRequests[chatId] = true;
+      await ctx.answerCbQuery('Введите параметры в формате: ROWS,COLS,MINES (например: 8,8,12)');
+      await ctx.editMessageText('Введите параметры сложности в формате: ROWS,COLS,MINES\nНапример: 8,8,12');
+      return;
     }
   }
 
@@ -230,7 +255,7 @@ bot.on('callback_query', async ctx => {
     return ctx.answerCbQuery('Игра окончена. Введите /new или выберите "Новая игра" в меню.');
   }
 
-  // Обработка нажатия на игровое поле (кнопки с данными вида cell_ряд_столбец)
+  // Обработка нажатия на игровое поле (callback_data вида cell_ряд_столбец)
   if (data.startsWith('cell_')) {
     const parts = data.split('_');
     const r = parseInt(parts[1], 10);
@@ -245,6 +270,7 @@ bot.on('callback_query', async ctx => {
     if (cell.mine) {
       cell.revealed = true;
       game.over = true;
+      // Обновляем сообщение с игровым полем с раскрытыми клетками
       await ctx.editMessageReplyMarkup(renderBoard(game, true).reply_markup);
       ctx.answerCbQuery('💥 Вы проиграли!');
       return ctx.reply('💥 Игра окончена. Введите /new или выберите "Новая игра" в меню.');
@@ -261,6 +287,31 @@ bot.on('callback_query', async ctx => {
         return ctx.answerCbQuery();
       }
     }
+  }
+});
+
+// ===== Обработка текстовых сообщений для кастомных настроек =====
+bot.on('text', async ctx => {
+  const chatId = ctx.chat.id;
+  // Если бот ожидает ввод параметров для кастомной сложности
+  if (customRequests[chatId]) {
+    const text = ctx.message.text;
+    const parts = text.split(',');
+    if (parts.length !== 3) {
+      await ctx.reply('Неверный формат. Введите параметры в формате: ROWS,COLS,MINES (например: 8,8,12)');
+      return;
+    }
+    const rows = parseInt(parts[0].trim(), 10);
+    const cols = parseInt(parts[1].trim(), 10);
+    const mines = parseInt(parts[2].trim(), 10);
+    if (isNaN(rows) || isNaN(cols) || isNaN(mines) || rows <= 0 || cols <= 0 || mines <= 0 || mines >= rows * cols) {
+      await ctx.reply('Неверные параметры. Убедитесь, что размеры положительные числа, и мин меньше общего количества клеток.');
+      return;
+    }
+    // Сохраняем кастомные настройки
+    chatSettings[chatId] = { rows, cols, mines };
+    customRequests[chatId] = false;
+    await ctx.reply(`Настройки сохранены: ${rows} строк, ${cols} столбцов, ${mines} мин.`);
   }
 });
 
